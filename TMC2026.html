@@ -3,9 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WB Складской учёт ТМЦ</title>
+    <title>WB Складской учёт ТМЦ (по складам)</title>
     <style>
-        /* Все стили без изменений */
         * {
             box-sizing: border-box;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -318,6 +317,19 @@
             background: #faf5ff;
             border-radius: 20px;
         }
+        #loader {
+            display: none;
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #8b4ec7;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 40px;
+            z-index: 1000;
+            font-weight: bold;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
     </style>
 </head>
 <body>
@@ -363,22 +375,65 @@
     </div>
 </div>
 
+<div id="loader">⏳ Загрузка...</div>
+
 <script>
     (function() {
-        // ---------- Ключи для localStorage ----------
+        // ---------- НАСТРОЙКИ GOOGLE SHEETS (ВСТАВЛЕНЫ ВАШИ ДАННЫЕ) ----------
+        const SPREADSHEET_ID = '13YgJV8bMtSnfdcUgwlTBdi_gdM70t-zsnOBRFJO6ZkM';  // Исправлено: только ID, без лишней части
+        const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzakBq-CM84DTEwLcmDbDyKa7ftCha498aFImVays0PvgI1IeR1NVngSfjT-R27d-mlaQ/exec';
+
+        // ---------- Ключи для localStorage (только склады и пароли) ----------
         const STORAGE_WAREHOUSES = 'wb_warehouses';
         const STORAGE_PASSWORDS = 'wb_passwords';
-        const GOODS_PREFIX = 'wb_goods_';
-        const STOCK_PREFIX = 'wb_stock_';
-        const OPS_PREFIX = 'wb_operations_';
 
-        // ---------- Глобальные переменные ----------
         let currentWarehouse = null;
         let currentUserPassword = '';
 
-        // ---------- Инициализация хранилищ с принудительной установкой паролей ----------
+        // ---------- Универсальная функция вызова API (с передачей warehouse) ----------
+        async function callAppsScript(action, sheet, data = null) {
+            const url = new URL(SCRIPT_URL);
+            url.searchParams.set('action', action);
+            url.searchParams.set('spreadsheetId', SPREADSHEET_ID);
+            if (sheet) url.searchParams.set('sheet', sheet);
+            if (currentWarehouse) url.searchParams.set('warehouse', currentWarehouse);
+            if (data) {
+                const paramName = action === 'saveGoods' ? 'goods' : (action === 'saveStock' ? 'stock' : 'ops');
+                url.searchParams.set(paramName, JSON.stringify(data));
+            }
+
+            try {
+                const response = await fetch(url.toString(), { method: 'POST' });
+                const result = await response.json();
+                if (result.error) throw new Error(result.error);
+                return result;
+            } catch (err) {
+                console.error('API error:', err);
+                showMessage('', 'Ошибка связи с сервером: ' + err.message, 'error');
+                throw err;
+            }
+        }
+
+        function showLoader(show) {
+            const loader = document.getElementById('loader');
+            if (loader) loader.style.display = show ? 'block' : 'none';
+        }
+
+        // ---------- Склады и пароли (локально) ----------
+        function getWarehouses() {
+            return JSON.parse(localStorage.getItem(STORAGE_WAREHOUSES)) || [];
+        }
+        function saveWarehouses(warehouses) {
+            localStorage.setItem(STORAGE_WAREHOUSES, JSON.stringify(warehouses));
+        }
+        function getPasswords() {
+            return JSON.parse(localStorage.getItem(STORAGE_PASSWORDS)) || {};
+        }
+        function savePasswords(passwords) {
+            localStorage.setItem(STORAGE_PASSWORDS, JSON.stringify(passwords));
+        }
+
         function initStorage() {
-            // Склады
             if (!localStorage.getItem(STORAGE_WAREHOUSES)) {
                 const defaultWarehouses = [
                     'Минск Щомыслицкий 2.0',
@@ -391,8 +446,6 @@
                 ];
                 localStorage.setItem(STORAGE_WAREHOUSES, JSON.stringify(defaultWarehouses));
             }
-
-            // Пароли для предопределённых складов (всегда обновляем, чтобы гарантировать вход)
             const defaultPasswords = {
                 'Минск Щомыслицкий 2.0': '211622',
                 'Минск Привольный': '50142756',
@@ -402,48 +455,23 @@
                 'Гомель': '300461',
                 'Орша': '329399'
             };
-
             let passwords = getPasswords();
-            // Обновляем/добавляем пароли для предопределённых складов
             Object.assign(passwords, defaultPasswords);
             savePasswords(passwords);
         }
         initStorage();
 
-        // ---------- Работа со складами ----------
-        function getWarehouses() {
-            return JSON.parse(localStorage.getItem(STORAGE_WAREHOUSES)) || [];
-        }
-
-        function saveWarehouses(warehouses) {
-            localStorage.setItem(STORAGE_WAREHOUSES, JSON.stringify(warehouses));
-        }
-
-        function getPasswords() {
-            return JSON.parse(localStorage.getItem(STORAGE_PASSWORDS)) || {};
-        }
-
-        function savePasswords(passwords) {
-            localStorage.setItem(STORAGE_PASSWORDS, JSON.stringify(passwords));
-        }
-
-        // ---------- Авторизация (прямая проверка пароля) ----------
         function tryLogin(warehouse, password) {
             const passwords = getPasswords();
             if (passwords.hasOwnProperty(warehouse)) {
-                if (passwords[warehouse] === password) {
-                    return { success: true };
-                } else {
-                    return { success: false, message: 'Неверный пароль' };
-                }
-            } else {
-                return { success: false, message: 'Склад не найден' };
-            }
+                if (passwords[warehouse] === password) return { success: true };
+                else return { success: false, message: 'Неверный пароль' };
+            } else return { success: false, message: 'Склад не найден' };
         }
 
-        // ---------- Демо-инициализация справочника ----------
-        function ensureDemoGoods(warehouse) {
-            let goods = getGoods(warehouse);
+        // ---------- Демо-инициализация (для нового склада) ----------
+        async function ensureDemoGoods() {
+            const goods = await getGoods();
             if (goods.length === 0) {
                 const demoList = [
                     "ВПП 2-х Слойная 1.2м*100м*40гр/м2 *РУЛОНЫ*",
@@ -482,35 +510,33 @@
                     "Курьер-пакет 550х650+40 (45 мкр) с QR *ПАЛЛЕТ* 11200 ШТ",
                     "Курьер-пакет 800х760+40 (45 мкр) с QR *ПАЛЛЕТ* 8750 ШТ"
                 ];
-                goods = demoList.map((name, idx) => ({
+                const newGoods = demoList.map((name, idx) => ({
                     id: 'g' + idx + Date.now() + Math.random(),
                     name: name,
                     piecesPerPallet: 100
                 }));
-                saveGoods(warehouse, goods);
-                saveStock(warehouse, []);
+                await saveGoods(newGoods);
+                await saveStock([]);
             }
         }
 
-        // ---------- Функции для работы с товарами и остатками ----------
-        function getGoods(warehouse) {
-            const key = GOODS_PREFIX + warehouse;
-            return JSON.parse(localStorage.getItem(key)) || [];
+        // ---------- Функции работы с данными (все передают currentWarehouse) ----------
+        async function getGoods() {
+            const result = await callAppsScript('getGoods', 'Товары');
+            return result.data || [];
         }
-        function saveGoods(warehouse, goods) {
-            const key = GOODS_PREFIX + warehouse;
-            localStorage.setItem(key, JSON.stringify(goods));
+        async function saveGoods(goods) {
+            await callAppsScript('saveGoods', 'Товары', goods);
         }
-        function getStock(warehouse) {
-            const key = STOCK_PREFIX + warehouse;
-            return JSON.parse(localStorage.getItem(key)) || [];
+        async function getStock() {
+            const result = await callAppsScript('getStock', 'Остатки');
+            return result.data || [];
         }
-        function saveStock(warehouse, stock) {
-            const key = STOCK_PREFIX + warehouse;
-            localStorage.setItem(key, JSON.stringify(stock));
+        async function saveStock(stock) {
+            await callAppsScript('saveStock', 'Остатки', stock);
         }
-        function updateStock(warehouse, goodId, newQty, newPallets) {
-            let stock = getStock(warehouse);
+        async function updateStock(goodId, newQty, newPallets) {
+            let stock = await getStock();
             const index = stock.findIndex(s => s.goodId === goodId);
             if (index >= 0) {
                 stock[index].quantity = newQty;
@@ -518,22 +544,21 @@
             } else {
                 stock.push({ goodId, quantity: newQty, pallets: newPallets });
             }
-            saveStock(warehouse, stock);
+            await saveStock(stock);
         }
-        function getStockItem(warehouse, goodId) {
-            const stock = getStock(warehouse);
+        async function getStockItem(goodId) {
+            const stock = await getStock();
             return stock.find(s => s.goodId === goodId) || { quantity: 0, pallets: 0 };
         }
-        function getOperations(warehouse) {
-            const key = OPS_PREFIX + warehouse;
-            return JSON.parse(localStorage.getItem(key)) || [];
+        async function getOperations() {
+            const result = await callAppsScript('getOperations', 'Операции');
+            return result.data || [];
         }
-        function saveOperations(warehouse, ops) {
-            const key = OPS_PREFIX + warehouse;
-            localStorage.setItem(key, JSON.stringify(ops));
+        async function saveOperations(ops) {
+            await callAppsScript('saveOperations', 'Операции', ops);
         }
 
-        // ---------- Добавление/удаление складов ----------
+        // ---------- Добавление/удаление складов (локально) ----------
         function addWarehouse(name, password) {
             if (!name || !password) return false;
             const warehouses = getWarehouses();
@@ -543,12 +568,8 @@
             const passwords = getPasswords();
             passwords[name] = password;
             savePasswords(passwords);
-            saveGoods(name, []);
-            saveStock(name, []);
-            saveOperations(name, []);
             return true;
         }
-
         function removeWarehouse(name) {
             const warehouses = getWarehouses();
             const idx = warehouses.indexOf(name);
@@ -558,13 +579,10 @@
             const passwords = getPasswords();
             delete passwords[name];
             savePasswords(passwords);
-            localStorage.removeItem(GOODS_PREFIX + name);
-            localStorage.removeItem(STOCK_PREFIX + name);
-            localStorage.removeItem(OPS_PREFIX + name);
             return true;
         }
 
-        // ---------- UI: рендеринг списка складов ----------
+        // ---------- UI ----------
         function renderWarehouseSelect() {
             const select = document.getElementById('warehouse-select');
             const warehouses = getWarehouses();
@@ -577,34 +595,38 @@
             });
         }
 
-        // ---------- Переключение вкладок ----------
-        function switchTab(tabId) {
+        async function switchTab(tabId) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             const tabButton = document.querySelector(`.tab[data-tab="${tabId}"]`);
             if (tabButton) tabButton.classList.add('active');
-            renderTabContent(tabId);
+            await renderTabContent(tabId);
         }
 
-        function renderTabContent(tabId) {
+        async function renderTabContent(tabId) {
             const container = document.getElementById('tab-content');
             if (!currentWarehouse) return;
-            switch (tabId) {
-                case 'catalog': renderCatalog(container); break;
-                case 'receipt': renderReceipt(container); break;
-                case 'dispatch': renderDispatch(container); break;
-                case 'inventory': renderInventory(container); break;
-                case 'history': renderHistory(container); break;
-                case 'balances': renderBalances(container); break;
-                default: container.innerHTML = '<div class="message">Выберите вкладку</div>';
+            showLoader(true);
+            try {
+                switch (tabId) {
+                    case 'catalog': await renderCatalog(container); break;
+                    case 'receipt': await renderReceipt(container); break;
+                    case 'dispatch': await renderDispatch(container); break;
+                    case 'inventory': await renderInventory(container); break;
+                    case 'history': await renderHistory(container); break;
+                    case 'balances': await renderBalances(container); break;
+                    default: container.innerHTML = '<div class="message">Выберите вкладку</div>';
+                }
+            } finally {
+                showLoader(false);
             }
         }
 
         // ---------- Рендер каталога ----------
-        function renderCatalog(container) {
-            let goods = getGoods(currentWarehouse);
+        async function renderCatalog(container) {
+            let goods = await getGoods();
             let html = `
                 <div class="flex-between">
-                    <h2 style="color:#8b4ec7;">Справочник товаров</h2>
+                    <h2 style="color:#8b4ec7;">Справочник товаров (склад: ${escapeHtml(currentWarehouse)})</h2>
                     <button class="btn" id="add-good-btn">➕ Добавить товар</button>
                 </div>
                 <div class="table-container">
@@ -625,65 +647,58 @@
             html += `</tbody></table></div>`;
             container.innerHTML = html;
 
-            document.getElementById('add-good-btn')?.addEventListener('click', () => {
+            document.getElementById('add-good-btn')?.addEventListener('click', async () => {
                 const name = prompt('Введите наименование товара:');
                 if (!name) return;
                 const ppp = parseInt(prompt('Количество штук на одной паллете (норма):', '100') || '100', 10);
-                if (isNaN(ppp) || ppp <= 0) {
-                    alert('ПУ-ПУ-ПУ');
-                    return;
-                }
+                if (isNaN(ppp) || ppp <= 0) { alert('ПУ-ПУ-ПУ'); return; }
                 goods.push({
                     id: 'g' + Date.now() + Math.random(),
                     name: name,
                     piecesPerPallet: ppp
                 });
-                saveGoods(currentWarehouse, goods);
-                renderCatalog(container);
+                await saveGoods(goods);
+                await renderCatalog(container);
             });
 
             document.querySelectorAll('.edit-good').forEach(btn => {
-                btn.addEventListener('click', (e) => {
+                btn.addEventListener('click', async (e) => {
                     const id = e.target.dataset.id;
                     const good = goods.find(g => g.id === id);
                     if (!good) return;
                     const newName = prompt('Новое наименование:', good.name);
                     if (newName === null) return;
                     const newPpp = parseInt(prompt('Новое количество штук на паллете:', good.piecesPerPallet) || good.piecesPerPallet, 10);
-                    if (isNaN(newPpp) || newPpp <= 0) {
-                        alert('ПУ-ПУ-ПУ');
-                        return;
-                    }
+                    if (isNaN(newPpp) || newPpp <= 0) { alert('ПУ-ПУ-ПУ'); return; }
                     good.name = newName;
                     good.piecesPerPallet = newPpp;
-                    saveGoods(currentWarehouse, goods);
-                    renderCatalog(container);
+                    await saveGoods(goods);
+                    await renderCatalog(container);
                 });
             });
 
             document.querySelectorAll('.delete-good').forEach(btn => {
-                btn.addEventListener('click', (e) => {
+                btn.addEventListener('click', async (e) => {
                     if (!confirm('Удалить товар? Также будут удалены все остатки и операции по нему.')) return;
                     const id = e.target.dataset.id;
                     goods = goods.filter(g => g.id !== id);
-                    saveGoods(currentWarehouse, goods);
-                    let stock = getStock(currentWarehouse);
+                    await saveGoods(goods);
+                    let stock = await getStock();
                     stock = stock.filter(s => s.goodId !== id);
-                    saveStock(currentWarehouse, stock);
-                    let ops = getOperations(currentWarehouse);
+                    await saveStock(stock);
+                    let ops = await getOperations();
                     ops = ops.filter(op => op.goodId !== id);
-                    saveOperations(currentWarehouse, ops);
-                    renderCatalog(container);
+                    await saveOperations(ops);
+                    await renderCatalog(container);
                 });
             });
         }
 
-        // ---------- Приход / Расход (с поиском товара и дробными паллетами) ----------
-        function renderOperationForm(container, type) {
-            const goods = getGoods(currentWarehouse);
+        // ---------- Приход / Расход ----------
+        async function renderOperationForm(container, type) {
+            const goods = await getGoods();
             const typeText = type === 'receipt' ? 'Приход' : 'Расход';
 
-            // Создаём HTML с input и datalist для поиска товара
             let html = `
                 <h2 style="color:#8b4ec7;">${typeText}</h2>
                 <div class="action-form">
@@ -700,7 +715,7 @@
                             <input type="number" id="op-qty" value="0" min="0" step="1">
                         </div>
                         <div class="form-group">
-                            <label>Количество паллет (можно дробные, например 1.5)</label>
+                            <label>Количество паллет (дробные, например 1.5)</label>
                             <input type="number" id="op-pallets" value="0.0" min="0" step="0.1">
                         </div>
                         <div class="form-group">
@@ -719,82 +734,56 @@
             const goodInput = document.getElementById('op-good-input');
             const qtyInput = document.getElementById('op-qty');
             const palletsInput = document.getElementById('op-pallets');
-            const goodsList = document.getElementById('op-goods-list');
             let updating = false;
 
-            // Функция для получения текущего товара (по введённому имени)
             function getCurrentGood() {
                 const name = goodInput.value.trim();
                 if (!name) return null;
-                // Ищем точное совпадение имени среди товаров
                 return goods.find(g => g.name === name) || null;
             }
-
             function getCurrentPPP() {
                 const good = getCurrentGood();
-                return good ? good.piecesPerPallet : 100; // значение по умолчанию
+                return good ? good.piecesPerPallet : 100;
             }
-
             function updatePalletsFromQty() {
                 if (updating) return;
                 updating = true;
                 const ppp = getCurrentPPP();
                 const qty = parseInt(qtyInput.value, 10);
                 if (!isNaN(qty) && qty >= 0) {
-                    // Рассчитываем паллеты с одним десятичным знаком (округление до десятых)
                     const pals = Math.round((qty / ppp) * 10) / 10;
                     palletsInput.value = pals.toFixed(1);
-                } else {
-                    palletsInput.value = '0.0';
-                }
+                } else palletsInput.value = '0.0';
                 updating = false;
             }
-
             function updateQtyFromPallets() {
                 if (updating) return;
                 updating = true;
                 const ppp = getCurrentPPP();
                 const pals = parseFloat(palletsInput.value);
                 if (!isNaN(pals) && pals >= 0) {
-                    // Округляем до целого числа штук
                     const qty = Math.round(pals * ppp);
                     qtyInput.value = qty;
-                } else {
-                    qtyInput.value = 0;
-                }
+                } else qtyInput.value = 0;
                 updating = false;
             }
-
             qtyInput.addEventListener('input', updatePalletsFromQty);
             palletsInput.addEventListener('input', updateQtyFromPallets);
             goodInput.addEventListener('change', () => {
-                // При изменении товара обновляем поля, если что-то уже введено
                 if (palletsInput.value && palletsInput.value !== '0.0') updateQtyFromPallets();
                 else if (qtyInput.value && qtyInput.value !== '0') updatePalletsFromQty();
             });
 
-            document.getElementById('op-save-btn').addEventListener('click', () => {
+            document.getElementById('op-save-btn').addEventListener('click', async () => {
                 const good = getCurrentGood();
-                if (!good) {
-                    alert('Выберите существующий товар из списка');
-                    showMessage('op-message', 'Товар не найден', 'error');
-                    return;
-                }
-                const goodId = good.id;
+                if (!good) { alert('Выберите существующий товар'); showMessage('op-message', 'Товар не найден', 'error'); return; }
                 let qty = parseInt(qtyInput.value, 10);
                 let pals = parseFloat(palletsInput.value);
                 const comment = document.getElementById('op-comment').value || '';
-                if (isNaN(qty) || qty < 0 || isNaN(pals) || pals < 0) {
-                    alert('ПУ-ПУ-ПУ');
-                    return;
-                }
-                if (qty === 0 && Math.abs(pals) < 0.0001) {
-                    alert('ПУ-ПУ-ПУ');
-                    showMessage('op-message', 'Добавьте хотя бы 1 штуку или 0.1 паллеты', 'error');
-                    return;
-                }
+                if (isNaN(qty) || qty < 0 || isNaN(pals) || pals < 0) { alert('ПУ-ПУ-ПУ'); return; }
+                if (qty === 0 && Math.abs(pals) < 0.0001) { alert('ПУ-ПУ-ПУ'); showMessage('op-message', 'Добавьте количество', 'error'); return; }
 
-                let stockItem = getStockItem(currentWarehouse, goodId);
+                let stockItem = await getStockItem(good.id);
                 let newQty = stockItem.quantity;
                 let newPals = stockItem.pallets;
 
@@ -802,21 +791,16 @@
                     newQty += qty;
                     newPals += pals;
                 } else {
-                    if (stockItem.quantity < qty || stockItem.pallets < pals - 0.0001) { // допуск на погрешность
-                        alert('ПУ-ПУ-ПУ');
-                        showMessage('op-message', 'Недостаточно товара на складе!', 'error');
-                        return;
+                    if (stockItem.quantity < qty || stockItem.pallets < pals - 0.0001) {
+                        alert('ПУ-ПУ-ПУ'); showMessage('op-message', 'Недостаточно товара на складе!', 'error'); return;
                     }
                     newQty -= qty;
                     newPals -= pals;
                 }
-
-                // Округляем новые паллеты до десятых (чтобы избежать накопления ошибок)
                 newPals = Math.round(newPals * 10) / 10;
+                await updateStock(good.id, newQty, newPals);
 
-                updateStock(currentWarehouse, goodId, newQty, newPals);
-
-                const ops = getOperations(currentWarehouse);
+                let ops = await getOperations();
                 ops.push({
                     id: 'op' + Date.now() + Math.random(),
                     date: new Date().toISOString(),
@@ -828,22 +812,19 @@
                     comment: comment,
                     user: currentUserPassword
                 });
-                saveOperations(currentWarehouse, ops);
+                await saveOperations(ops);
 
                 showMessage('op-message', 'Операция успешно проведена!', 'success');
-                goodInput.value = '';
-                qtyInput.value = '0';
-                palletsInput.value = '0.0';
-                document.getElementById('op-comment').value = '';
+                goodInput.value = ''; qtyInput.value = '0'; palletsInput.value = '0.0'; document.getElementById('op-comment').value = '';
             });
         }
 
-        function renderReceipt(container) { renderOperationForm(container, 'receipt'); }
-        function renderDispatch(container) { renderOperationForm(container, 'dispatch'); }
+        async function renderReceipt(container) { await renderOperationForm(container, 'receipt'); }
+        async function renderDispatch(container) { await renderOperationForm(container, 'dispatch'); }
 
-        // ---------- Инвентаризация (с поиском товара и дробными паллетами) ----------
-        function renderInventory(container) {
-            const goods = getGoods(currentWarehouse);
+        // ---------- Инвентаризация ----------
+        async function renderInventory(container) {
+            const goods = await getGoods();
             let html = `
                 <h2 style="color:#8b4ec7;">Инвентаризация (корректировка остатков)</h2>
                 <div class="action-form">
@@ -860,7 +841,7 @@
                             <input type="number" id="inv-qty" min="0" value="0" step="1">
                         </div>
                         <div class="form-group">
-                            <label>Новое количество паллет (можно дробные, например 1.5)</label>
+                            <label>Новое количество паллет</label>
                             <input type="number" id="inv-pallets" min="0" value="0.0" step="0.1">
                         </div>
                         <div class="form-group">
@@ -883,15 +864,12 @@
 
             function getCurrentGood() {
                 const name = goodInput.value.trim();
-                if (!name) return null;
                 return goods.find(g => g.name === name) || null;
             }
-
             function getCurrentPPP() {
                 const good = getCurrentGood();
                 return good ? good.piecesPerPallet : 100;
             }
-
             function updatePalletsFromQty() {
                 if (updating) return;
                 updating = true;
@@ -900,12 +878,9 @@
                 if (!isNaN(qty) && qty >= 0) {
                     const pals = Math.round((qty / ppp) * 10) / 10;
                     palletsInput.value = pals.toFixed(1);
-                } else {
-                    palletsInput.value = '0.0';
-                }
+                } else palletsInput.value = '0.0';
                 updating = false;
             }
-
             function updateQtyFromPallets() {
                 if (updating) return;
                 updating = true;
@@ -914,12 +889,9 @@
                 if (!isNaN(pals) && pals >= 0) {
                     const qty = Math.round(pals * ppp);
                     qtyInput.value = qty;
-                } else {
-                    qtyInput.value = 0;
-                }
+                } else qtyInput.value = 0;
                 updating = false;
             }
-
             qtyInput.addEventListener('input', updatePalletsFromQty);
             palletsInput.addEventListener('input', updateQtyFromPallets);
             goodInput.addEventListener('change', () => {
@@ -927,29 +899,18 @@
                 else if (qtyInput.value && qtyInput.value !== '0') updatePalletsFromQty();
             });
 
-            document.getElementById('inv-save-btn').addEventListener('click', () => {
+            document.getElementById('inv-save-btn').addEventListener('click', async () => {
                 const good = getCurrentGood();
-                if (!good) {
-                    alert('Выберите существующий товар из списка');
-                    showMessage('inv-message', 'Товар не найден', 'error');
-                    return;
-                }
-                const goodId = good.id;
+                if (!good) { alert('Выберите товар'); showMessage('inv-message', 'Товар не найден', 'error'); return; }
                 let newQty = parseInt(qtyInput.value, 10);
                 let newPals = parseFloat(palletsInput.value);
-                if (isNaN(newQty) || newQty < 0 || isNaN(newPals) || newPals < 0) {
-                    alert('ПУ-ПУ-ПУ');
-                    return;
-                }
+                if (isNaN(newQty) || newQty < 0 || isNaN(newPals) || newPals < 0) { alert('ПУ-ПУ-ПУ'); return; }
                 const comment = document.getElementById('inv-comment').value || 'Инвентаризация';
-                const oldStock = getStockItem(currentWarehouse, goodId);
-
-                // Округлим новые паллеты до десятых
+                const oldStock = await getStockItem(good.id);
                 newPals = Math.round(newPals * 10) / 10;
+                await updateStock(good.id, newQty, newPals);
 
-                updateStock(currentWarehouse, goodId, newQty, newPals);
-
-                const ops = getOperations(currentWarehouse);
+                let ops = await getOperations();
                 ops.push({
                     id: 'op' + Date.now() + Math.random(),
                     date: new Date().toISOString(),
@@ -961,19 +922,18 @@
                     comment: comment + ` (было: ${oldStock.quantity} шт, ${oldStock.pallets} пал)`,
                     user: currentUserPassword
                 });
-                saveOperations(currentWarehouse, ops);
-
+                await saveOperations(ops);
                 showMessage('inv-message', 'Остатки скорректированы', 'success');
                 setTimeout(() => renderInventory(container), 1000);
             });
         }
 
         // ---------- История ----------
-        function renderHistory(container) {
-            let ops = getOperations(currentWarehouse);
+        async function renderHistory(container) {
+            let ops = await getOperations();
             ops.sort((a,b) => new Date(b.date) - new Date(a.date));
             let html = `
-                <h2 style="color:#8b4ec7;">История операций</h2>
+                <h2 style="color:#8b4ec7;">История операций (склад: ${escapeHtml(currentWarehouse)})</h2>
                 <div class="filter-group">
                     <input type="text" id="history-filter" placeholder="Фильтр по товару" style="padding:10px; border-radius:30px; border:2px solid #d9b3ff;">
                     <select id="history-type-filter">
@@ -1022,71 +982,31 @@
             }
         }
 
-        // ---------- Остатки с выбором склада ----------
-        function renderBalances(container) {
-            const warehouses = getWarehouses();
+        // ---------- Остатки ----------
+        async function renderBalances(container) {
+            const goods = await getGoods();
+            const stock = await getStock();
+            let stockData = stock.map(s => {
+                const good = goods.find(g => g.id === s.goodId);
+                return {
+                    goodId: s.goodId,
+                    name: good ? good.name : 'Неизвестный товар',
+                    quantity: s.quantity,
+                    pallets: s.pallets
+                };
+            }).sort((a,b) => a.name.localeCompare(b.name));
+
             let html = `
-                <h2 style="color:#8b4ec7;">Остатки</h2>
-                <div class="warehouse-selector">
-                    <label for="balance-warehouse">Выберите склад: </label>
-                    <select id="balance-warehouse" style="padding:10px; border-radius:30px; border:2px solid #d9b3ff; min-width:250px;">
-                        <option value="ALL">Все склады</option>
-                        ${warehouses.map(w => `<option value="${w}">${w}</option>`).join('')}
-                    </select>
-                </div>
-                <div id="balance-display"></div>
+                <h2 style="color:#8b4ec7;">Остатки (склад: ${escapeHtml(currentWarehouse)})</h2>
+                <table>
+                    <thead><tr><th>Наименование</th><th>Штук</th><th>Паллет</th></tr></thead>
+                    <tbody>
             `;
+            stockData.forEach(item => {
+                html += `<tr><td>${escapeHtml(item.name)}</td><td>${item.quantity}</td><td>${item.pallets}</td></tr>`;
+            });
+            html += `</tbody></table>`;
             container.innerHTML = html;
-
-            function showBalancesForWarehouse(warehouse) {
-                const display = document.getElementById('balance-display');
-                let stockData = [];
-                if (warehouse === 'ALL') {
-                    const allGoodsMap = new Map();
-                    warehouses.forEach(wh => {
-                        const goods = getGoods(wh);
-                        const stock = getStock(wh);
-                        stock.forEach(s => {
-                            const good = goods.find(g => g.id === s.goodId);
-                            if (!good) return;
-                            if (!allGoodsMap.has(s.goodId)) {
-                                allGoodsMap.set(s.goodId, { name: good.name, quantity: 0, pallets: 0 });
-                            }
-                            const item = allGoodsMap.get(s.goodId);
-                            item.quantity += s.quantity;
-                            item.pallets += s.pallets;
-                        });
-                    });
-                    stockData = Array.from(allGoodsMap.entries()).map(([id, val]) => ({ goodId: id, ...val }));
-                } else {
-                    const goods = getGoods(warehouse);
-                    const stock = getStock(warehouse);
-                    stockData = stock.map(s => {
-                        const good = goods.find(g => g.id === s.goodId);
-                        return {
-                            goodId: s.goodId,
-                            name: good ? good.name : 'Неизвестный товар',
-                            quantity: s.quantity,
-                            pallets: s.pallets
-                        };
-                    }).sort((a,b) => a.name.localeCompare(b.name));
-                }
-
-                let tableHtml = `
-                    <table>
-                        <thead><tr><th>Наименование</th><th>Штук</th><th>Паллет</th></tr></thead>
-                        <tbody>
-                `;
-                stockData.forEach(item => {
-                    tableHtml += `<tr><td>${escapeHtml(item.name)}</td><td>${item.quantity}</td><td>${item.pallets}</td></tr>`;
-                });
-                tableHtml += `</tbody></table>`;
-                display.innerHTML = tableHtml;
-            }
-
-            const selector = document.getElementById('balance-warehouse');
-            selector.addEventListener('change', () => showBalancesForWarehouse(selector.value));
-            showBalancesForWarehouse('ALL');
         }
 
         // ---------- Утилиты ----------
@@ -1108,15 +1028,14 @@
                 msg.textContent = text;
                 msg.className = 'message ' + (type === 'error' ? 'error' : 'success');
                 setTimeout(() => msg.style.display = 'none', 3000);
+            } else {
+                alert(text);
             }
         }
 
-        // ---------- Вход в систему ----------
-        function login(warehouse, password) {
-            if (!warehouse || !password) {
-                alert('ПУ-ПУ-ПУ');
-                return false;
-            }
+        // ---------- Вход / Выход ----------
+        async function login(warehouse, password) {
+            if (!warehouse || !password) { alert('ПУ-ПУ-ПУ'); return false; }
             const result = tryLogin(warehouse, password);
             if (result.success) {
                 currentWarehouse = warehouse;
@@ -1124,8 +1043,8 @@
                 document.getElementById('login-screen').style.display = 'none';
                 document.getElementById('main-app').style.display = 'block';
                 document.getElementById('current-warehouse-label').textContent = warehouse;
-                ensureDemoGoods(warehouse);
-                switchTab('catalog');
+                await ensureDemoGoods();
+                await switchTab('catalog');
                 return true;
             } else {
                 alert(result.message || 'Ошибка входа');
@@ -1133,7 +1052,6 @@
             }
         }
 
-        // ---------- Выход из системы (очищаем поле пароля) ----------
         function logout() {
             currentWarehouse = null;
             currentUserPassword = '';
@@ -1143,7 +1061,7 @@
             renderWarehouseSelect();
         }
 
-        // ---------- Инициализация после загрузки ----------
+        // ---------- Инициализация ----------
         window.addEventListener('DOMContentLoaded', () => {
             renderWarehouseSelect();
 
@@ -1161,32 +1079,24 @@
                 if (addWarehouse(name, password)) {
                     renderWarehouseSelect();
                     alert('Склад добавлен');
-                } else {
-                    alert('ПУ-ПУ-ПУ (склад уже существует или ошибка)');
-                }
+                } else alert('ПУ-ПУ-ПУ');
             });
 
             document.getElementById('remove-warehouse-btn').addEventListener('click', () => {
                 const warehouses = getWarehouses();
                 if (warehouses.length === 0) return alert('Нет складов');
-                const name = prompt('Введите название склада для удаления (внимание, данные будут потеряны!):\n' + warehouses.join(', '));
+                const name = prompt('Введите название склада для удаления:\n' + warehouses.join(', '));
                 if (!name) return;
                 if (confirm(`Точно удалить склад ${name}?`)) {
-                    if (removeWarehouse(name)) {
-                        renderWarehouseSelect();
-                    } else {
-                        alert('ПУ-ПУ-ПУ');
-                    }
+                    if (removeWarehouse(name)) renderWarehouseSelect();
+                    else alert('ПУ-ПУ-ПУ');
                 }
             });
 
             document.getElementById('logout-btn').addEventListener('click', logout);
 
             document.querySelectorAll('.tab').forEach(tab => {
-                tab.addEventListener('click', () => {
-                    const tabId = tab.dataset.tab;
-                    switchTab(tabId);
-                });
+                tab.addEventListener('click', () => switchTab(tab.dataset.tab));
             });
         });
     })();
